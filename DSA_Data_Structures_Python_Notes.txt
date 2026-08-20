@@ -1,0 +1,296 @@
+DSA DATA STRUCTURES — PYTHON NOTES
+
+1. STACK
+
+Definition:
+A Stack is a linear data structure that follows LIFO (Last In, First Out).
+
+Example:
+Stack of plates — the last plate placed is the first one removed.
+
+Operations:
+- Push → Add an element
+- Pop → Remove the top element
+- Peek → View the top element
+- isEmpty → Check whether the stack is empty
+
+Python:
+stack = []
+
+stack.append(10)
+stack.append(20)
+stack.append(30)
+
+print(stack.pop())  # 30
+
+Applications:
+- Undo/Redo
+- Browser Back button
+- Function calls
+- DFS
+- Expression evaluation
+
+Time Complexity:
+Push/Pop → O(1)
+
+
+2. QUEUE
+
+Definition:
+A Queue is a linear data structure that follows FIFO (First In, First Out).
+
+Example:
+People waiting in a bank queue.
+
+Operations:
+- Enqueue → Add element
+- Dequeue → Remove element
+- Front → First element
+- isEmpty → Check whether empty
+
+Python:
+from collections import deque
+
+queue = deque()
+
+queue.append(10)
+queue.append(20)
+queue.append(30)
+
+print(queue.popleft())  # 10
+
+Applications:
+- Printer queue
+- CPU scheduling
+- Customer service systems
+- Network requests
+- BFS
+
+Time Complexity:
+Enqueue/Dequeue → O(1)
+
+
+3. LINKED LIST
+
+Definition:
+A Linked List is a collection of nodes, where each node stores data and a reference to another node.
+
+Structure:
+[10 | next] → [20 | next] → [30 | None]
+
+Node:
+class Node:
+    def __init__(self, data):
+        self.data = data
+        self.next = None
+
+Types:
+1. Singly Linked List
+2. Doubly Linked List
+3. Circular Linked List
+
+Applications:
+- Music playlists
+- Browser navigation
+- Memory management
+- Implementing stacks and queues
+
+Advantage:
+Insertion and deletion can be efficient when the correct node position is known.
+
+
+4. HASH TABLE
+
+Definition:
+A Hash Table stores data using key-value pairs.
+
+Python's dict is commonly used for this purpose.
+
+Python:
+student = {
+    "name": "Rahul",
+    "age": 21,
+    "marks": 85
+}
+
+print(student["name"])
+
+Operations:
+- Insert
+- Search
+- Delete
+- Update
+
+Average Time Complexity:
+- Search → O(1)
+- Insert → O(1)
+- Delete → O(1)
+
+Applications:
+- Database lookups
+- Caching
+- Counting frequencies
+- User records
+- Fast data retrieval
+
+
+5. TREE
+
+Definition:
+A Tree is a hierarchical data structure consisting of nodes connected by edges.
+
+Example:
+        A
+       / \
+      B   C
+     / \
+    D   E
+
+Important Terms:
+- Root → Top node
+- Parent → Node having children
+- Child → Node below a parent
+- Leaf → Node with no children
+- Edge → Connection between nodes
+- Depth → Distance from root
+- Height → Longest path to a leaf
+
+Types:
+- Binary Tree
+- Binary Search Tree (BST)
+- AVL Tree
+- Heap
+- B-Tree
+- Trie
+
+Binary Search Tree:
+Left < Root < Right
+
+Applications:
+- File systems
+- Database indexing
+- Searching
+- Sorting
+- Decision trees
+
+
+6. HEAP
+
+Definition:
+A Heap is a specialized tree-based data structure commonly used for implementing priority queues.
+
+Types:
+- Min Heap → Smallest element at the root
+- Max Heap → Largest element at the root
+
+Python:
+import heapq
+
+heap = []
+
+heapq.heappush(heap, 30)
+heapq.heappush(heap, 10)
+heapq.heappush(heap, 20)
+
+print(heapq.heappop(heap))
+
+Output:
+10
+
+Python's heapq provides a min-heap.
+
+Applications:
+- Priority queues
+- CPU scheduling
+- Dijkstra's algorithm
+- Finding Top-K elements
+- Heap Sort
+
+
+7. GRAPH
+
+Definition:
+A Graph consists of vertices (nodes) and edges (connections).
+
+Types:
+
+Directed Graph:
+A → B → C
+
+Undirected Graph:
+A — B — C
+
+Weighted Graph:
+A —10— B
+
+Python — Adjacency List:
+graph = {
+    "A": ["B", "C"],
+    "B": ["A", "D"],
+    "C": ["A"],
+    "D": ["B"]
+}
+
+Important Algorithms:
+- BFS — Breadth First Search
+- DFS — Depth First Search
+- Dijkstra
+- Bellman-Ford
+- Prim
+- Kruskal
+
+Applications:
+- Google Maps
+- Social networks
+- Airline routes
+- Computer networks
+- Recommendation systems
+- Fraud detection
+
+
+8. TRIE
+
+Definition:
+A Trie is a tree-based data structure designed for efficient string and prefix searching.
+
+Example:
+       root
+        |
+        c
+        |
+        a
+      / | \
+     r  t  n
+
+It can represent:
+car
+cat
+can
+
+Applications:
+- Autocomplete
+- Search engines
+- Spell checking
+- Dictionary applications
+- Word prediction
+- Prefix searching
+
+
+QUICK REVISION
+
+Data Structure | Principle | Python
+Stack | LIFO | list
+Queue | FIFO | deque
+Linked List | Nodes + Links | Custom class
+Hash Table | Key → Value | dict
+Tree | Hierarchical | Custom class
+Heap | Priority | heapq
+Graph | Nodes + Edges | dict / lists
+Trie | Prefix Search | Custom class
+
+
+DSA LEARNING ORDER
+
+Stack → Queue → Linked List → Hash Table → Tree → Heap → Graph → Trie → Searching → Sorting → Recursion → Time & Space Complexity
+
+For a Python → DSA → AI/ML path, these are the core data structures to understand before moving deeply into algorithms.
