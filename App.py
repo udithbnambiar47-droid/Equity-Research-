@@ -1,11 +1,587 @@
 """
+Equity Research App (single-file version): DCF, scenarios, Monte Carlo, relative valuation, export.
+Run: streamlit run app.py   |   Educational use only. Not investment advice.
+"""
+from __future__ import annotations
+
+"""
+Valuation engine: DCF, scenarios, Monte Carlo and sensitivity.
+
+Pure NumPy, no Streamlit imports, so it can be unit-tested on its own.
+
+One vectorised code path serves everything: pass scalars for a single DCF,
+or arrays (one entry per simulation) for Monte Carlo. Parameters broadcast
+against a (simulations x years) grid.
+"""
+
+
+from dataclasses import dataclass, replace
+
+import numpy as np
+
+TV_METHODS = ("gordon", "exit", "blend")
+
+
+@dataclass(frozen=True)
+class Assumptions:
+    rev0: float              # base-year revenue (or base FCF in fallback mode)
+    growth_start: float      # year-1 revenue growth; fades linearly to terminal_g
+    margin_start: float      # current EBIT margin
+    margin_target: float     # EBIT margin reached after `margin_years`
+    margin_years: int
+    tax: float               # tax rate on EBIT
+    da_pct: float            # D&A as % of revenue
+    capex_pct: float         # capex as % of revenue
+    nwc_pct: float           # investment in NWC as % of incremental revenue
+    wacc: float
+    terminal_g: float
+    exit_multiple: float     # EV / EBITDA applied to final-year EBITDA
+    years: int
+    net_debt: float
+    shares: float
+    tv_method: str = "gordon"  # gordon | exit | blend
+
+
+def _c(x):
+    """Parameter -> column vector (n, 1)."""
+    return np.atleast_1d(np.asarray(x, dtype=float))[:, None]
+
+
+def run_dcf(a: Assumptions) -> dict:
+    """Run the DCF. Returns 2-D arrays (n, years) and 1-D arrays (n,)."""
+    T = int(a.years)
+    t = np.arange(1, T + 1, dtype=float)[None, :]
+
+    g0, tg, w = _c(a.growth_start), _c(a.terminal_g), _c(a.wacc)
+    m0, m1 = _c(a.margin_start), _c(a.margin_target)
+    tax, da_p, cx_p, nwc, mult = (_c(a.tax), _c(a.da_pct), _c(a.capex_pct),
+                                  _c(a.nwc_pct), _c(a.exit_multiple))
+
+    growth = g0 + (tg - g0) * (t - 1) / max(T - 1, 1)          # fades to terminal g
+    k = max(min(int(a.margin_years), T), 1)
+    margin = m0 + (m1 - m0) * np.minimum(t / k, 1.0)           # linear ramp to target
+
+    rev = float(a.rev0) * np.cumprod(1.0 + growth, axis=1)
+    prev = np.concatenate([np.full((rev.shape[0], 1), float(a.rev0)), rev[:, :-1]], axis=1)
+
+    ebit = rev * margin
+    da = rev * da_p
+    capex = rev * cx_p
+    d_nwc = nwc * (rev - prev)
+    fcff = ebit * (1.0 - tax) + da - capex - d_nwc
+    ebitda = ebit + da
+
+    disc = (1.0 + w) ** t
+    pv = fcff / disc
+
+    f_T, e_T = fcff[:, -1:], ebitda[:, -1:]
+    valid = w > tg
+    den = np.where(valid, w - tg, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tv_g = f_T * (1.0 + tg) / den                           # Gordon growth
+        tv_x = e_T * mult                                       # exit multiple
+        implied_g = (tv_x * w - f_T) / (tv_x + f_T)             # g implied by exit TV
+        implied_mult = tv_g / e_T                               # multiple implied by Gordon TV
+
+    if a.tv_method == "gordon":
+        tv = tv_g
+    elif a.tv_method == "exit":
+        tv = tv_x
+    else:
+        tv = (tv_g + tv_x) / 2.0
+
+    pv_tv = tv / disc[:, -1:]
+    ev = pv.sum(axis=1, keepdims=True) + pv_tv
+    equity = ev - a.net_debt
+    per_share = equity / a.shares
+
+    one = lambda x: x[:, 0]  # noqa: E731
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tv_share = pv_tv / ev
+    return {
+        "years": T,
+        "growth": growth, "margin": margin, "rev": rev, "ebit": ebit, "da": da,
+        "capex": capex, "d_nwc": d_nwc, "fcff": fcff, "ebitda": ebitda,
+        "disc": disc, "pv": pv,
+        "tv_gordon": one(tv_g), "tv_exit": one(tv_x), "tv": one(tv), "pv_tv": one(pv_tv),
+        "ev": one(ev), "equity": one(equity), "per_share": one(per_share),
+        "implied_g": one(implied_g), "implied_mult": one(implied_mult),
+        "tv_share": one(tv_share), "pv_sum": pv.sum(axis=1),
+    }
+
+
+def point_value(a: Assumptions) -> float:
+    """Intrinsic value per share for scalar assumptions."""
+    return float(run_dcf(a)["per_share"][0])
+
+
+# --------------------------------------------------------------------------
+# Scenarios
+# --------------------------------------------------------------------------
+def apply_scenario(a: Assumptions, d_growth=0.0, d_margin=0.0, d_wacc=0.0,
+                   d_tg=0.0, d_mult=0.0) -> Assumptions:
+    """Shift the key drivers (all deltas in decimals, multiple delta in turns)."""
+    return replace(
+        a,
+        growth_start=a.growth_start + d_growth,
+        margin_target=a.margin_target + d_margin,
+        wacc=a.wacc + d_wacc,
+        terminal_g=max(a.terminal_g + d_tg, 0.0),
+        exit_multiple=max(a.exit_multiple + d_mult, 1.0),
+    )
+
+
+# --------------------------------------------------------------------------
+# Monte Carlo
+# --------------------------------------------------------------------------
+def monte_carlo(a: Assumptions, n: int, seed: int, sd: dict) -> np.ndarray:
+    """
+    Simulate intrinsic value per share. Each key input is drawn independently
+    from a normal distribution centred on the base case, then clipped to
+    sensible bounds. `sd` keys: growth, margin, wacc, tg (decimals), mult_rel (fraction).
+    """
+    rng = np.random.default_rng(seed)
+    g = np.clip(rng.normal(a.growth_start, sd["growth"], n), -0.20, 0.60)
+    m = np.clip(rng.normal(a.margin_target, sd["margin"], n), -0.10, max(0.70, a.margin_target))
+    w = np.clip(rng.normal(a.wacc, sd["wacc"], n), 0.04, 0.25)
+    tg = np.clip(rng.normal(a.terminal_g, sd["tg"], n), 0.0, 0.05)
+    tg = np.minimum(tg, w - 0.01)                       # keep WACC > g
+    mult = np.maximum(rng.normal(a.exit_multiple, a.exit_multiple * sd["mult_rel"], n), 1.0)
+    res = run_dcf(replace(a, growth_start=g, margin_target=m, wacc=w,
+                          terminal_g=tg, exit_multiple=mult))
+    out = res["per_share"]
+    return out[np.isfinite(out)]
+
+
+def mc_summary(samples: np.ndarray, price: float, band: float) -> dict:
+    pct = {p: float(np.percentile(samples, p)) for p in (5, 10, 25, 50, 75, 90, 95)}
+    return {
+        "mean": float(samples.mean()), "std": float(samples.std()), "pct": pct,
+        "p_above": float((samples > price).mean()),
+        "p_above_band": float((samples > price * (1 + band)).mean()),
+        "p_below_band": float((samples < price * (1 - band)).mean()),
+        "n": int(samples.size),
+    }
+
+
+# --------------------------------------------------------------------------
+# Sensitivity
+# --------------------------------------------------------------------------
+def sensitivity(a: Assumptions, axis: str = "tg", n: int = 5):
+    """Grid of value/share: WACC (rows) vs terminal growth or exit multiple (cols)."""
+    steps = np.linspace(-(n // 2), n // 2, n)
+    waccs = a.wacc + steps * 0.01
+    if axis == "tg":
+        cols = np.maximum(a.terminal_g + steps * 0.005, 0.0)
+    else:
+        cols = np.maximum(a.exit_multiple + steps * 1.0, 1.0)
+    grid = np.full((n, n), np.nan)
+    for i, w in enumerate(waccs):
+        for j, c in enumerate(cols):
+            kw = {"terminal_g": float(c)} if axis == "tg" else {"exit_multiple": float(c)}
+            grid[i, j] = point_value(replace(a, wacc=float(w), **kw))
+    return waccs, cols, grid
+
+
+# --------------------------------------------------------------------------
+# WACC and formatting helpers
+# --------------------------------------------------------------------------
+def compute_wacc(rf, beta, erp, cost_debt, tax, mcap, debt):
+    ke = rf + beta * erp
+    kd = cost_debt * (1 - tax)
+    total = mcap + debt
+    we, wd = (mcap / total, debt / total) if total > 0 else (1.0, 0.0)
+    return we * ke + wd * kd, ke, kd, we, wd
+
+
+def fmt_big(x, cur=""):
+    if x is None or not np.isfinite(x):
+        return "n/a"
+    for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if abs(x) >= div:
+            return f"{cur}{x / div:,.2f}{unit}"
+    return f"{cur}{x:,.0f}"
+
+
+"""Market-data access (Yahoo Finance via yfinance) and default-assumption derivation."""
+
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+# A few starter peer sets. Anything else: the user types their own peers.
+DEFAULT_PEERS = {
+    "AAPL": ["MSFT", "GOOGL", "META", "AMZN"],
+    "MSFT": ["AAPL", "GOOGL", "ORCL", "ADBE"],
+    "TCS.NS": ["INFY.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS"],
+    "INFY.NS": ["TCS.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS"],
+    "HDFCBANK.NS": ["ICICIBANK.NS", "KOTAKBANK.NS", "AXISBANK.NS", "SBIN.NS"],
+    "ICICIBANK.NS": ["HDFCBANK.NS", "KOTAKBANK.NS", "AXISBANK.NS", "SBIN.NS"],
+}
+
+
+def _series(df, *names) -> pd.Series:
+    """First matching row of a yfinance statement as a year-indexed series (oldest first)."""
+    if df is None or getattr(df, "empty", True):
+        return pd.Series(dtype=float)
+    for n in names:
+        if n in df.index:
+            s = pd.to_numeric(df.loc[n], errors="coerce").dropna().astype(float)
+            s.index = pd.to_datetime(s.index).year
+            s = s[~s.index.duplicated(keep="first")]
+            return s.sort_index()
+    return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_company(ticker: str) -> dict:
+    t = yf.Ticker(ticker)
+    return {
+        "info": t.info or {},
+        "cashflow": t.cashflow,
+        "income": t.income_stmt,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_multiples(tickers: tuple) -> pd.DataFrame:
+    rows = []
+    for tk in tickers:
+        try:
+            i = yf.Ticker(tk).info or {}
+        except Exception:
+            i = {}
+        rows.append({
+            "Ticker": tk,
+            "Name": i.get("shortName") or tk,
+            "Market cap": i.get("marketCap"),
+            "P/E (TTM)": i.get("trailingPE"),
+            "P/E (Fwd)": i.get("forwardPE"),
+            "EV/EBITDA": i.get("enterpriseToEbitda"),
+            "EV/Revenue": i.get("enterpriseToRevenue"),
+        })
+    df = pd.DataFrame(rows)
+    for c in ("Market cap", "P/E (TTM)", "P/E (Fwd)", "EV/EBITDA", "EV/Revenue"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.replace([np.inf, -np.inf], np.nan)
+
+
+@dataclass
+class Defaults:
+    has_operating: bool
+    rev0: float = np.nan
+    growth: float = 0.08
+    margin_now: float = np.nan
+    margin_target: float = np.nan
+    da_pct: float = 0.04
+    capex_pct: float = 0.05
+    nwc_pct: float = 0.05
+    tax: float = 0.21
+    ebitda_ttm: float = np.nan
+    eps: float = np.nan
+    fcf_hist: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    rev_hist: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    margin_hist: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    fcf_year: int = 0
+
+
+def _tail_mean(s: pd.Series, n: int = 3, default: float = np.nan) -> float:
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    return float(s.tail(n).mean()) if len(s) else default
+
+
+def _fcf_history(cf) -> pd.Series:
+    s = _series(cf, "Free Cash Flow")
+    if s.empty:
+        ocf = _series(cf, "Operating Cash Flow", "Total Cash From Operating Activities")
+        capex = _series(cf, "Capital Expenditure")
+        if ocf.empty or capex.empty:
+            return pd.Series(dtype=float)
+        s = (ocf + capex).dropna()  # capex is negative in yfinance
+    return s
+
+
+def derive(company: dict) -> Defaults:
+    """Derive sensible starting assumptions from reported history."""
+    info, cf, inc = company["info"], company["cashflow"], company["income"]
+
+    rev = _series(inc, "Total Revenue", "Operating Revenue")
+    ebit = _series(inc, "EBIT", "Operating Income")
+    da = _series(cf, "Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation")
+    capex = _series(cf, "Capital Expenditure")
+    d_wc = _series(cf, "Change In Working Capital")
+    tax_rate = _series(inc, "Tax Rate For Calcs")
+    fcf = _fcf_history(cf)
+
+    margin = (ebit / rev).dropna() if len(rev) and len(ebit) else pd.Series(dtype=float)
+    has_op = bool(len(rev) and len(margin) and rev.iloc[-1] > 0)
+
+    d = Defaults(has_operating=has_op, fcf_hist=fcf, rev_hist=rev, margin_hist=margin)
+    d.fcf_year = int(fcf.index[-1]) if len(fcf) else 0
+    d.eps = info.get("trailingEps", np.nan) or np.nan
+
+    if has_op:
+        d.rev0 = float(rev.iloc[-1])
+        pos = rev[rev > 0]
+        if len(pos) >= 2 and pos.index[-1] > pos.index[0]:
+            n = pos.index[-1] - pos.index[0]
+            d.growth = float(np.clip((pos.iloc[-1] / pos.iloc[0]) ** (1 / n) - 1, -0.05, 0.30))
+        d.margin_now = float(margin.iloc[-1])
+        d.margin_target = float(np.clip(_tail_mean(margin, 3, d.margin_now), -0.10, 0.60))
+        d.da_pct = float(np.clip(_tail_mean(da / rev, 3, 0.04), 0.0, 0.30))
+        d.capex_pct = float(np.clip(_tail_mean(capex.abs() / rev, 3, 0.05), 0.0, 0.40))
+        d.tax = float(np.clip(_tail_mean(tax_rate, 3, 0.21), 0.05, 0.40))
+        nwc = (-d_wc / rev.diff()).replace([np.inf, -np.inf], np.nan).dropna()
+        d.nwc_pct = float(np.clip(nwc.median(), 0.0, 0.30)) if len(nwc) else 0.05
+
+    ebitda = info.get("ebitda")
+    if not ebitda and has_op and len(da):
+        ebitda = float(ebit.iloc[-1] + da.iloc[-1])
+    d.ebitda_ttm = float(ebitda) if ebitda else np.nan
+    return d
+
+
+"""
+Formatting and report export (Excel and PDF).
+
+A report is a plain dict assembled by app.py:
+
+    {
+      "title", "ticker", "name", "currency", "date",
+      "price", "verdict", "summary": [(label, value_str), ...],
+      "tables": [{"name", "df", "spec": {col: kind}, "pdf": bool}, ...],
+      "football": [(label, low, mid, high), ...],
+      "mc_samples": np.ndarray | None,
+    }
+
+`spec` kinds: big | price | num | pct | x | int | txt
+"""
+
+
+import io
+from xml.sax.saxutils import escape
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+
+
+XL_FORMATS = {"big": "#,##0", "price": "#,##0.00", "num": "#,##0.00",
+              "pct": "0.0%", "x": '0.0"x"', "int": "0", "txt": "@"}
+
+
+def _fmt_val(v, kind: str, cur: str = "") -> str:
+    if v is None or (isinstance(v, (float, np.floating)) and not np.isfinite(v)):
+        return "n/a"
+    if pd.isna(v) if not isinstance(v, str) else False:
+        return "n/a"
+    try:
+        if kind == "big":
+            return fmt_big(float(v), cur)
+        if kind == "price":
+            return f"{cur}{float(v):,.2f}"
+        if kind == "num":
+            return f"{float(v):,.2f}"
+        if kind == "pct":
+            return f"{float(v):.1%}"
+        if kind == "x":
+            return f"{float(v):.1f}x"
+        if kind == "int":
+            return f"{int(v)}"
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
+def format_df(df: pd.DataFrame, spec: dict, cur: str = "") -> pd.DataFrame:
+    """Return a copy of df as display strings according to spec."""
+    out = pd.DataFrame(index=df.index)
+    for c in df.columns:
+        kind = spec.get(c, "txt")
+        out[c] = [_fmt_val(v, kind, cur) for v in df[c]]
+    return out
+
+
+# --------------------------------------------------------------------------
+# Excel
+# --------------------------------------------------------------------------
+def build_excel(report: dict) -> bytes:
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    head_fill = PatternFill("solid", fgColor="1F3A5F")
+    head_font = Font(bold=True, color="FFFFFF")
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        summary = pd.DataFrame(report["summary"], columns=["Item", "Value"])
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+        used = {"Summary"}
+        specs = {"Summary": {}}
+
+        for t in report["tables"]:
+            name = t["name"][:31]
+            while name in used:
+                name = name[:28] + "_2"
+            used.add(name)
+            specs[name] = t["spec"]
+            t["df"].to_excel(xw, sheet_name=name, index=False)
+
+        for name, ws in xw.sheets.items():
+            spec = specs.get(name, {})
+            for cell in ws[1]:
+                cell.fill, cell.font = head_fill, head_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.freeze_panes = "A2"
+            headers = [c.value for c in ws[1]]
+            for j, h in enumerate(headers, start=1):
+                kind = spec.get(h, "txt")
+                width = len(str(h))
+                for row in ws.iter_rows(min_row=2, min_col=j, max_col=j):
+                    cell = row[0]
+                    if kind != "txt" and isinstance(cell.value, (int, float)):
+                        cell.number_format = XL_FORMATS[kind]
+                    width = max(width, len(str(cell.value)) if cell.value is not None else 0)
+                ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = min(max(width + 3, 10), 60)
+    return bio.getvalue()
+
+
+# --------------------------------------------------------------------------
+# Charts for the PDF
+# --------------------------------------------------------------------------
+def _png(fig) -> io.BytesIO:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def football_png(rows, price, cur):
+    fig, ax = plt.subplots(figsize=(7.2, 0.55 * len(rows) + 1.0))
+    for i, (label, lo, mid, hi) in enumerate(rows):
+        ax.barh(i, hi - lo, left=lo, color="#3B6FB6", height=0.5)
+        if mid is not None and np.isfinite(mid):
+            ax.plot([mid, mid], [i - 0.25, i + 0.25], color="white", lw=2)
+        ax.text(hi, i, f"  {lo:,.0f} - {hi:,.0f}", va="center", fontsize=7)
+    ax.axvline(price, color="#C0392B", ls="--", lw=1.2)
+    ax.text(price, -0.8, f"Price {price:,.2f}", color="#C0392B", fontsize=7, ha="center")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([r[0] for r in rows], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel(f"Value per share ({cur.strip()})", fontsize=8)
+    ax.tick_params(axis="x", labelsize=7)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    return _png(fig)
+
+
+def mc_png(samples, price, cur):
+    lo, hi = np.percentile(samples, [1, 99])
+    fig, ax = plt.subplots(figsize=(7.2, 2.6))
+    ax.hist(np.clip(samples, lo, hi), bins=60, color="#3B6FB6")
+    ax.axvline(price, color="#C0392B", ls="--", lw=1.2, label=f"Price {price:,.2f}")
+    ax.axvline(np.median(samples), color="black", lw=1.2, label=f"Median {np.median(samples):,.2f}")
+    ax.legend(fontsize=7, frameon=False)
+    ax.set_xlabel(f"Intrinsic value per share ({cur.strip()})", fontsize=8)
+    ax.tick_params(labelsize=7)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    return _png(fig)
+
+
+# --------------------------------------------------------------------------
+# PDF
+# --------------------------------------------------------------------------
+def build_pdf(report: dict) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (Image, KeepTogether, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+
+    cur = report["currency"] + " "          # Helvetica has no currency glyphs, use the code
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Title"], fontSize=17, spaceAfter=2, alignment=0)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=11, spaceBefore=10, spaceAfter=4,
+                        textColor=colors.HexColor("#1F3A5F"))
+    small = ParagraphStyle("small", parent=styles["Normal"], fontSize=7.5, textColor=colors.grey)
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=9)
+
+    def safe(x):
+        """Helvetica only covers Latin-1; swap currency symbols and unknown glyphs."""
+        x = str(x).replace("₹", "INR ").replace("€", "EUR ").replace("Δ", "Chg ")
+        return x.encode("latin-1", "replace").decode("latin-1")
+
+    def table(df, spec, col_align_left=1):
+        fdf = format_df(df, spec, cur)
+        data = [[safe(c) for c in fdf.columns]] + [[safe(v) for v in row] for row in fdf.values.tolist()]
+        tb = Table(data, repeatRows=1, hAlign="LEFT")
+        st_ = [
+            ("FONT", (0, 0), (-1, -1), "Helvetica", 7.5),
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 7.5),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F3A5F")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (col_align_left, 0), (-1, -1), "RIGHT"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F5F9")]),
+            ("LINEBELOW", (0, -1), (-1, -1), 0.4, colors.grey),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ]
+        tb.setStyle(TableStyle(st_))
+        return tb
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm,
+                            title=report["title"], author="DCF Equity Research App")
+    story = [
+        Paragraph(escape(safe(report["title"])), h1),
+        Paragraph(escape(safe(f"{report['name']} ({report['ticker']})  |  {report['date']}  |  prices in {report['currency']}")), small),
+        Spacer(1, 6),
+        Paragraph(f"<b>Verdict: {escape(report['verdict'])}</b>", ParagraphStyle(
+            "v", parent=body, fontSize=13, textColor=colors.HexColor(report.get("verdict_color", "#1F3A5F")))),
+        Spacer(1, 4),
+    ]
+
+    sm = pd.DataFrame(report["summary"], columns=["Item", "Value"])
+    story.append(table(sm, {}))
+
+    if report.get("football"):
+        story += [Paragraph("Valuation summary (football field)", h2),
+                  Image(football_png(report["football"], report["price"], cur), width=175 * mm,
+                        height=(0.55 * len(report["football"]) + 1.0) / 7.2 * 175 * mm * 0.97)]
+    samples = report.get("mc_samples")
+    if samples is not None and len(samples):
+        story += [Paragraph("Monte Carlo distribution", h2),
+                  Image(mc_png(samples, report["price"], cur), width=175 * mm, height=175 * mm * 2.6 / 7.2)]
+
+    for t in report["tables"]:
+        if not t.get("pdf", True):
+            continue
+        story.append(KeepTogether([Paragraph(escape(safe(t["name"])), h2), table(t["df"], t["spec"])]))
+
+    story += [Spacer(1, 10), Paragraph(
+        "Educational use only; not investment advice. Data from Yahoo Finance (yfinance) may be delayed "
+        "or incomplete. Model output depends entirely on the stated assumptions.", small)]
+    doc.build(story)
+    return buf.getvalue()
+
+
+"""
 Equity Research App: DCF, scenarios, Monte Carlo and relative valuation.
 
 Run locally:  streamlit run app.py
 Educational use only. Not investment advice.
 """
 
-from __future__ import annotations
 
 import re
 from dataclasses import replace
@@ -16,9 +592,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-import engine as eng
-import export as ex
-import market_data as md
+
+
+
 
 st.set_page_config(page_title="DCF Equity Research", page_icon="📈", layout="wide")
 
@@ -41,13 +617,13 @@ with st.sidebar:
 
     with st.spinner(f"Fetching {ticker}..."):
         try:
-            company = md.load_company(ticker)
+            company = load_company(ticker)
         except Exception as e:  # network / rate limit
             st.error(f"Could not fetch data: {e}")
             st.stop()
 
     info = company["info"]
-    d = md.derive(company)
+    d = derive(company)
     price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
     shares = info.get("sharesOutstanding")
     if not price or not shares:
@@ -109,7 +685,7 @@ with st.sidebar:
 
     st.header("6. Peers")
     peers_txt = st.text_area("Peer tickers (comma separated)", key=K("peers"), height=80,
-                             value=", ".join(md.DEFAULT_PEERS.get(ticker, [])),
+                             value=", ".join(DEFAULT_PEERS.get(ticker, [])),
                              help="Used for P/E and EV/EBITDA relative valuation.")
 
 # ==========================================================================
@@ -131,9 +707,9 @@ if fin_cur and fin_cur != currency:
                "Convert inputs to one currency before trusting the valuation.")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Current price", f"{cur}{price:,.2f}")
-m2.metric("Market cap", eng.fmt_big(mcap, cur))
+m2.metric("Market cap", fmt_big(mcap, cur))
 m3.metric("Beta", f"{beta:.2f}")
-m4.metric("Net debt", eng.fmt_big(net_debt, cur))
+m4.metric("Net debt", fmt_big(net_debt, cur))
 
 # ==========================================================================
 # Operating assumptions
@@ -152,7 +728,7 @@ with st.expander("Operating assumptions", expanded=True):
         growth = c2.slider("FCF growth, year 1 (%)", -10.0, 40.0, round(g_def * 100, 1), 0.5, key=K("g")) / 100
         if rev0 <= 0:
             st.warning("Base FCF is zero or negative; a DCF is unreliable. Override with a normalised figure.")
-        a = eng.Assumptions(rev0=rev0, growth_start=growth, margin_start=1.0, margin_target=1.0, margin_years=1,
+        a = Assumptions(rev0=rev0, growth_start=growth, margin_start=1.0, margin_target=1.0, margin_years=1,
                             tax=0.0, da_pct=0.0, capex_pct=0.0, nwc_pct=0.0, wacc=0.0, terminal_g=terminal_g,
                             exit_multiple=exit_mult, years=years, net_debt=net_debt, shares=float(shares),
                             tv_method="gordon")
@@ -174,7 +750,7 @@ with st.expander("Operating assumptions", expanded=True):
                                   0.5, key=K("nwc")) / 100
         if capex_pct < da_pct:
             st.warning("Capex is below D&A. Final-year FCF (used for terminal value) may be overstated.")
-        a = eng.Assumptions(rev0=rev0, growth_start=growth, margin_start=d.margin_now,
+        a = Assumptions(rev0=rev0, growth_start=growth, margin_start=d.margin_now,
                             margin_target=margin_target, margin_years=margin_years, tax=tax, da_pct=da_pct,
                             capex_pct=capex_pct, nwc_pct=nwc_pct, wacc=0.0, terminal_g=terminal_g,
                             exit_multiple=exit_mult, years=years, net_debt=net_debt, shares=float(shares),
@@ -182,7 +758,7 @@ with st.expander("Operating assumptions", expanded=True):
 
 # ---- WACC ---------------------------------------------------------------
 if wacc_mode.startswith("Calculate"):
-    wacc, ke, kd, we, wd = eng.compute_wacc(rf, beta, erp, cost_debt, tax, mcap, debt)
+    wacc, ke, kd, we, wd = compute_wacc(rf, beta, erp, cost_debt, tax, mcap, debt)
     with st.expander("WACC build-up"):
         st.write(f"Cost of equity (CAPM): **{ke:.2%}** = {rf:.2%} + {beta:.2f} × {erp:.2%}")
         st.write(f"After-tax cost of debt: **{kd:.2%}**; weights: equity **{we:.1%}**, debt **{wd:.1%}**")
@@ -197,7 +773,7 @@ a = replace(a, wacc=wacc)
 # ==========================================================================
 # Base case
 # ==========================================================================
-base = eng.run_dcf(a)
+base = run_dcf(a)
 iv = float(base["per_share"][0])
 upside = iv / price - 1
 if upside > band:
@@ -238,7 +814,7 @@ with t_fc:
             "PV of FCFF": base["pv"][0]})
         fc_spec = {"Revenue": "big", "Growth": "pct", "EBITDA": "big", "EBIT": "big", "EBIT margin": "pct",
                    "Capex": "big", "NWC change": "big", "FCFF": "big", "PV of FCFF": "big"}
-    st.dataframe(ex.format_df(fc, fc_spec, cur), hide_index=True)
+    st.dataframe(format_df(fc, fc_spec, cur), hide_index=True)
 
     if not fallback:
         fig = go.Figure()
@@ -283,9 +859,9 @@ with t_scn:
 
     rows = []
     for _, r in scn_in.iterrows():
-        sa = eng.apply_scenario(a, r[C_G] / 100, 0.0 if fallback else r[C_M] / 100, r[C_W] / 100,
+        sa = apply_scenario(a, r[C_G] / 100, 0.0 if fallback else r[C_M] / 100, r[C_W] / 100,
                                 r[C_T] / 100, r[C_X])
-        rs = eng.run_dcf(sa)
+        rs = run_dcf(sa)
         v = float(rs["per_share"][0])
         rows.append({"Scenario": r["Scenario"], "Probability": float(r[C_P]), "Revenue growth Y1": sa.growth_start,
                      "Target margin": sa.margin_target, "WACC": sa.wacc, "Terminal g": sa.terminal_g,
@@ -297,7 +873,7 @@ with t_scn:
     scn_spec = {"Probability": "pct", "Revenue growth Y1": "pct", "Target margin": "pct", "WACC": "pct",
                 "Terminal g": "pct", "Exit multiple": "x", "Value / share": "price", "Upside": "pct"}
     shown = scn.drop(columns=["Target margin", "Exit multiple"]) if fallback else scn
-    st.dataframe(ex.format_df(shown, scn_spec, cur), hide_index=True)
+    st.dataframe(format_df(shown, scn_spec, cur), hide_index=True)
 
     s1, s2 = st.columns(2)
     s1.metric("Probability-weighted value", f"{cur}{weighted:,.2f}" if np.isfinite(weighted) else "n/a",
@@ -317,12 +893,12 @@ scn_vals = scn["Value / share"].dropna()
 # Monte Carlo tab
 # ==========================================================================
 with t_mc:
-    samples = eng.monte_carlo(a, int(n_sims), int(seed), sd)
+    samples = monte_carlo(a, int(n_sims), int(seed), sd)
     if samples.size < 100:
         st.error("Too few valid simulations; widen WACC vs terminal growth headroom.")
         mc = None
     else:
-        mc = eng.mc_summary(samples, price, band)
+        mc = mc_summary(samples, price, band)
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Median value / share", f"{cur}{mc['pct'][50]:,.2f}")
         k2.metric("Mean value / share", f"{cur}{mc['mean']:,.2f}")
@@ -341,7 +917,7 @@ with t_mc:
                                "Value / share": [mc["pct"][p] for p in (5, 10, 25, 50, 75, 90, 95)]
                                + [mc["mean"], mc["std"]]})
         mc_spec = {"Value / share": "price"}
-        st.dataframe(ex.format_df(mc_tbl, mc_spec, cur), hide_index=True)
+        st.dataframe(format_df(mc_tbl, mc_spec, cur), hide_index=True)
         st.caption(f"{mc['n']:,} valid simulations. Inputs are drawn independently from normal distributions "
                    "around the base case and clipped to sane bounds; real-world inputs are correlated "
                    "(for example growth and margins), so treat the spread as indicative.")
@@ -356,14 +932,14 @@ with t_rel:
         st.info("Add peer tickers in the sidebar (section 6) to value the company on peer P/E and EV/EBITDA.")
     else:
         with st.spinner("Fetching peer multiples..."):
-            peers_df = md.load_multiples(tuple(peer_list))
+            peers_df = load_multiples(tuple(peer_list))
         own = pd.DataFrame([{"Ticker": ticker, "Name": name[:28], "Market cap": mcap,
                              "P/E (TTM)": info.get("trailingPE"), "P/E (Fwd)": info.get("forwardPE"),
                              "EV/EBITDA": info.get("enterpriseToEbitda"), "EV/Revenue": info.get("enterpriseToRevenue")}])
         for c in own.columns[2:]:
             own[c] = pd.to_numeric(own[c], errors="coerce")
         peer_spec = {"Market cap": "big", "P/E (TTM)": "x", "P/E (Fwd)": "x", "EV/EBITDA": "x", "EV/Revenue": "x"}
-        st.dataframe(ex.format_df(pd.concat([own, peers_df], ignore_index=True), peer_spec, cur), hide_index=True)
+        st.dataframe(format_df(pd.concat([own, peers_df], ignore_index=True), peer_spec, cur), hide_index=True)
         st.caption("First row is the company itself. Negative or missing multiples are ignored in the statistics.")
 
         def q(col, p):
@@ -386,7 +962,7 @@ with t_rel:
         rel_spec = {"Peer P25": "x", "Peer median": "x", "Peer P75": "x",
                     "Value @ P25": "price", "Value @ median": "price", "Value @ P75": "price"}
         st.markdown("**Implied value per share from peer multiples**")
-        st.dataframe(ex.format_df(rel_tbl, rel_spec, cur), hide_index=True)
+        st.dataframe(format_df(rel_tbl, rel_spec, cur), hide_index=True)
         st.caption(f"Company TTM EPS: {eps:,.2f}" if np.isfinite(eps) else "Company EPS unavailable (or negative).")
         if not (np.isfinite(ebitda) and ebitda > 0):
             st.caption("Company EBITDA unavailable or negative, so EV/EBITDA value is not computed.")
@@ -398,7 +974,7 @@ with t_sen:
     axis_label = st.radio("Column axis", ["Terminal growth", "Exit multiple"], horizontal=True,
                           index=1 if tv_method == "exit" else 0, disabled=fallback)
     axis = "tg" if (fallback or axis_label == "Terminal growth") else "mult"
-    waccs, cols, grid = eng.sensitivity(a, axis)
+    waccs, cols, grid = sensitivity(a, axis)
     col_names = [f"{c:.1%}" if axis == "tg" else f"{c:.1f}x" for c in cols]
     sens = pd.DataFrame(grid, columns=col_names)
     sens.insert(0, "WACC", waccs)
@@ -440,7 +1016,7 @@ with t_val:
                       "Equity value", "Shares outstanding", "Intrinsic value / share"],
         "Value": [base["pv_sum"][0], base["pv_tv"][0], base["ev"][0], -net_debt, base["equity"][0],
                   float(shares), iv]})
-    brs = ex.format_df(bridge, {"Value": "big"}, cur)
+    brs = format_df(bridge, {"Value": "big"}, cur)
     brs.loc[brs["Component"] == "Intrinsic value / share", "Value"] = f"{cur}{iv:,.2f}"
     st.markdown("**Enterprise to equity bridge**")
     st.dataframe(brs, hide_index=True)
@@ -451,8 +1027,8 @@ with t_val:
     if fallback:
         st.info("Exit-multiple cross-check needs EBITDA, so it is available in the revenue & margin model.")
     else:
-        rg = eng.run_dcf(replace(a, tv_method="gordon"))
-        rx = eng.run_dcf(replace(a, tv_method="exit"))
+        rg = run_dcf(replace(a, tv_method="gordon"))
+        rx = run_dcf(replace(a, tv_method="exit"))
         vg, vx = float(rg["per_share"][0]), float(rx["per_share"][0])
         xc = pd.DataFrame({
             "Terminal value method": ["Gordon growth", "Exit multiple (EV/EBITDA)"],
@@ -463,7 +1039,7 @@ with t_val:
         xc_spec = {"Value / share": "price", "vs price": "pct", "TV % of EV": "pct",
                    "Terminal growth": "pct", "Exit EV/EBITDA": "x"}
         st.markdown("**Terminal value cross-check**")
-        st.dataframe(ex.format_df(xc, xc_spec, cur), hide_index=True)
+        st.dataframe(format_df(xc, xc_spec, cur), hide_index=True)
         st.caption("Gordon row shows the exit multiple its terminal value implies; the exit-multiple row shows "
                    "the perpetual growth rate its terminal value implies.")
         gap = abs(vx / vg - 1) if vg else np.nan
@@ -496,7 +1072,7 @@ with t_exp:
     sig = (ticker, round(iv, 4), int(n_sims), int(seed), fallback, tv_method, round(wacc, 5))
     if st.button("Generate Excel and PDF report", type="primary"):
         assump_rows = [("Forecast model", "FCF growth (fallback)" if fallback else "Revenue & margin"),
-                       ("Projection years", years), ("Base " + ("FCF" if fallback else "revenue"), eng.fmt_big(a.rev0, cur)),
+                       ("Projection years", years), ("Base " + ("FCF" if fallback else "revenue"), fmt_big(a.rev0, cur)),
                        ("Growth, year 1", f"{a.growth_start:.1%}"), ("Terminal growth", f"{a.terminal_g:.1%}"),
                        ("WACC", f"{wacc:.2%}"), ("Tax rate", f"{tax:.1%}")]
         if not fallback:
@@ -505,7 +1081,7 @@ with t_exp:
                             ("D&A % revenue", f"{a.da_pct:.1%}"), ("Capex % revenue", f"{a.capex_pct:.1%}"),
                             ("NWC % of revenue change", f"{a.nwc_pct:.1%}"),
                             ("Terminal value method", tv_label), ("Exit EV/EBITDA", f"{a.exit_multiple:.1f}x")]
-        assump_rows += [("Net debt", eng.fmt_big(net_debt, cur)), ("Shares outstanding", eng.fmt_big(float(shares))),
+        assump_rows += [("Net debt", fmt_big(net_debt, cur)), ("Shares outstanding", fmt_big(float(shares))),
                         ("Beta", f"{beta:.2f}"), ("Margin-of-safety band", f"±{band:.0%}")]
 
         summary = [("Company", f"{name} ({ticker})"), ("Current price", f"{cur}{price:,.2f}"),
@@ -546,7 +1122,7 @@ with t_exp:
                   "mc_samples": samples if mc is not None else None}
         with st.spinner("Building files..."):
             st.session_state["report_files"] = {
-                "sig": sig, "xlsx": ex.build_excel(report), "pdf": ex.build_pdf(report)}
+                "sig": sig, "xlsx": build_excel(report), "pdf": build_pdf(report)}
 
     files = st.session_state.get("report_files")
     if files is None:
