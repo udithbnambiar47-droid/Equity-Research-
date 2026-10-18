@@ -4,6 +4,8 @@ Run: streamlit run app.py   |   Educational use only. Not investment advice.
 """
 from __future__ import annotations
 
+
+
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -192,7 +194,6 @@ def fmt_big(x, cur=""):
     return f"{cur}{x:,.0f}"
 
 
-"""Market-data access (Yahoo Finance via yfinance) and default-assumption derivation."""
 
 
 from dataclasses import dataclass, field
@@ -334,21 +335,6 @@ def derive(company: dict) -> Defaults:
     return d
 
 
-"""
-Formatting and report export (Excel and PDF).
-
-A report is a plain dict assembled by app.py:
-
-    {
-      "title", "ticker", "name", "currency", "date",
-      "price", "verdict", "summary": [(label, value_str), ...],
-      "tables": [{"name", "df", "spec": {col: kind}, "pdf": bool}, ...],
-      "football": [(label, low, mid, high), ...],
-      "mc_samples": np.ndarray | None,
-    }
-
-`spec` kinds: big | price | num | pct | x | int | txt
-"""
 
 
 import io
@@ -564,12 +550,6 @@ def build_pdf(report: dict) -> bytes:
     return buf.getvalue()
 
 
-"""
-Equity Research App: DCF, scenarios, Monte Carlo and relative valuation.
-
-Run locally:  streamlit run app.py
-Educational use only. Not investment advice.
-"""
 
 
 import re
