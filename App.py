@@ -4,17 +4,6 @@ Run: streamlit run app.py   |   Educational use only. Not investment advice.
 """
 from __future__ import annotations
 
-"""
-Valuation engine: DCF, scenarios, Monte Carlo and sensitivity.
-
-Pure NumPy, no Streamlit imports, so it can be unit-tested on its own.
-
-One vectorised code path serves everything: pass scalars for a single DCF,
-or arrays (one entry per simulation) for Monte Carlo. Parameters broadcast
-against a (simulations x years) grid.
-"""
-
-
 from dataclasses import dataclass, replace
 
 import numpy as np
